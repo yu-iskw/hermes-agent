@@ -86,7 +86,19 @@ class MCPOAuthManager:
         oauth_scope: McpOAuthScope | None = None,
     ) -> Optional[Any]:
         """Return/build a provider for exactly one OAuth identity scope."""
+        # Prepare the string-keyed MCP runtime before identity resolution. This
+        # matters on headless startup: resolution must fail closed without a
+        # human, while a later authenticated request still needs a per-user
+        # lazy connection rather than reusing a different user's task.
+        from tools.mcp_oauth_runtime import (
+            bind_runtime_scope,
+            prepare_oauth_server_runtime,
+        )
+
+        prepare_oauth_server_runtime(server_name)
         scope = self._resolve_scope(oauth_scope)
+        bind_runtime_scope(server_name, scope)
+
         key = self._key(server_name, oauth_scope=scope)
         with self._entries_lock:
             entry = self._entries.get(key)
