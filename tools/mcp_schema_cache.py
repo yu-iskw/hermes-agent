@@ -64,21 +64,25 @@ def _save_all(data: Dict[str, Any]) -> None:
 
 
 def _is_per_user_oauth_server(server_name: str) -> bool:
-    """Return True only for OAuth servers under explicit per-user mode."""
-    try:
-        from tools.mcp_oauth_identity import get_oauth_identity_mode
+    """Return True only for OAuth servers under explicit per-user mode.
 
-        if get_oauth_identity_mode() != "per_user":
-            return False
-        from hermes_cli.config import load_config
+    Invalid identity-mode configuration deliberately propagates from
+    ``get_oauth_identity_mode``. A typo must not turn a scoped/private cache
+    read into a legacy shared-cache read.
+    """
+    from tools.mcp_oauth_identity import get_oauth_identity_mode
 
-        servers = (load_config() or {}).get("mcp_servers") or {}
-        config = servers.get(server_name) if isinstance(servers, dict) else None
-        return isinstance(config, dict) and str(config.get("auth") or "").strip().lower() == "oauth"
-    except Exception:
-        # Invalid identity configuration is not a reason to read a less-scoped
-        # cache. The caller will surface the configuration error elsewhere.
+    if get_oauth_identity_mode() != "per_user":
         return False
+
+    from hermes_cli.config import load_config
+
+    servers = (load_config() or {}).get("mcp_servers") or {}
+    config = servers.get(server_name) if isinstance(servers, dict) else None
+    return (
+        isinstance(config, dict)
+        and str(config.get("auth") or "").strip().lower() == "oauth"
+    )
 
 
 def _scoped_cache_key(server_name: str) -> str | None:
@@ -138,8 +142,6 @@ def write_cache_entry(
     """Persist schemas under the exact current requesting-user scope."""
     cache_key = _scoped_cache_key(server_name)
     if cache_key is None:
-        # Never write an anonymous/shared cache entry while per-user OAuth is
-        # configured but no authenticated principal is bound.
         return
 
     entry = {
@@ -171,9 +173,6 @@ def clear_cache_entry(server_name: str) -> None:
                 del data[cache_key]
                 changed = True
         elif _is_per_user_oauth_server(server_name):
-            # No principal is bound (e.g. config/admin maintenance). Clearing is
-            # intentionally destructive across this logical server's cache
-            # entries but does not grant access to any cached content.
             prefix = f"{server_name}@@u-v1-"
             for key in list(data):
                 if key.startswith(prefix):
