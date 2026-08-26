@@ -1,9 +1,11 @@
 """Persistent MCP tool-schema cache for lazy server startup.
 
-Stores per-server tool manifests on disk so Hermes can register MCP tools
-into the agent snapshot without spawning the stdio child process at idle
-dashboard startup. Cache entries are keyed by server name + a fingerprint
-of the connection config (command/args/url/tools filters).
+Stores tool manifests on disk so Hermes can register MCP tools without eagerly
+spawning a server. Historically this file assumed the cache was "per-user local
+disk". That assumption is false for a shared Hermes gateway: many authenticated
+humans use the same HERMES_HOME. In ``mcp.oauth.identity_mode: per_user``, OAuth
+server cache entries therefore use the same opaque requesting-user scope as the
+credential/connection boundary (#78174).
 """
 
 from __future__ import annotations
@@ -58,25 +60,56 @@ def _load_all() -> Dict[str, Any]:
 def _save_all(data: Dict[str, Any]) -> None:
     from utils import atomic_json_write
 
-    # Cache dir + 0o600: sibling precedent in tools/registry.py
-    # _save_discovery_cache; the cache file is trusted input on the lazy
-    # registration path, so keep it user-only.
     atomic_json_write(_cache_path(), data, mode=0o600)
 
 
-def get_cached_entry(server_name: str, fingerprint: str) -> Optional[dict]:
-    """Return cached entry when fingerprint matches (and TTL holds), else None.
+def _is_per_user_oauth_server(server_name: str) -> bool:
+    """Return True only for OAuth servers under explicit per-user mode."""
+    try:
+        from tools.mcp_oauth_identity import get_oauth_identity_mode
 
-    MCP 2026-07-28 (SEP-2549): ``tools/list`` results carry ``ttlMs`` as a
-    freshness hint. When the live discovery path recorded one, an entry
-    older than its TTL is treated as a miss so the next startup re-probes
-    the server instead of serving a stale manifest forever. Entries without
-    a recorded TTL (pre-2026 servers) keep the old never-expires behavior.
-    ``cacheScope`` is irrelevant here: this cache is per-user local disk,
-    which satisfies even ``private``.
+        if get_oauth_identity_mode() != "per_user":
+            return False
+        from hermes_cli.config import load_config
+
+        servers = (load_config() or {}).get("mcp_servers") or {}
+        config = servers.get(server_name) if isinstance(servers, dict) else None
+        return isinstance(config, dict) and str(config.get("auth") or "").strip().lower() == "oauth"
+    except Exception:
+        # Invalid identity configuration is not a reason to read a less-scoped
+        # cache. The caller will surface the configuration error elsewhere.
+        return False
+
+
+def _scoped_cache_key(server_name: str) -> str | None:
+    """Return the on-disk key, or None when per-user identity is unavailable."""
+    if not _is_per_user_oauth_server(server_name):
+        return server_name
+
+    from tools.mcp_oauth_identity import try_resolve_oauth_scope
+
+    scope = try_resolve_oauth_scope()
+    if scope is None:
+        # Headless startup has no authenticated human. Serving another user's
+        # private schema would leak capability metadata and could register tools
+        # that the current principal is not entitled to see.
+        return None
+    return f"{server_name}@@{scope.key}"
+
+
+def get_cached_entry(server_name: str, fingerprint: str) -> Optional[dict]:
+    """Return a valid entry for the exact current identity scope.
+
+    MCP 2026-07-28 (SEP-2549) ``ttlMs`` freshness hints are preserved. In
+    per-user OAuth mode we scope all entries, not only ones explicitly marked
+    ``private``: doing so is conservative and avoids depending on an untrusted
+    or older server to classify user-specific capability schemas correctly.
     """
+    cache_key = _scoped_cache_key(server_name)
+    if cache_key is None:
+        return None
     with _cache_lock:
-        entry = _load_all().get(server_name)
+        entry = _load_all().get(cache_key)
     if not isinstance(entry, dict):
         return None
     if entry.get("fingerprint") != fingerprint:
@@ -102,12 +135,13 @@ def write_cache_entry(
     ttl_ms: Optional[float] = None,
     cache_scope: Optional[str] = None,
 ) -> None:
-    """Persist tool schemas after a successful live connect.
+    """Persist schemas under the exact current requesting-user scope."""
+    cache_key = _scoped_cache_key(server_name)
+    if cache_key is None:
+        # Never write an anonymous/shared cache entry while per-user OAuth is
+        # configured but no authenticated principal is bound.
+        return
 
-    ``ttl_ms``/``cache_scope`` are the SEP-2549 hints from the server's
-    ``tools/list`` result (2026-07-28 servers). ``written_at`` anchors TTL
-    expiry in :func:`get_cached_entry`.
-    """
     entry = {
         "fingerprint": fingerprint,
         "tools": tools,
@@ -120,23 +154,32 @@ def write_cache_entry(
         entry["cache_scope"] = cache_scope
     with _cache_lock:
         data = _load_all()
-        # Write-through fires on every registration (reconnects,
-        # list_changed refreshes); skip the load-all+rewrite churn when the
-        # entry is byte-identical to what is already on disk. TTL'd entries
-        # always rewrite: written_at must advance or the entry would expire
-        # at its ORIGINAL write time no matter how many live reconnects
-        # confirmed it since.
-        if "written_at" not in entry and data.get(server_name) == entry:
+        if "written_at" not in entry and data.get(cache_key) == entry:
             return
-        data[server_name] = entry
+        data[cache_key] = entry
         _save_all(data)
 
 
 def clear_cache_entry(server_name: str) -> None:
+    """Clear current scoped entry, or all scoped entries from admin context."""
+    cache_key = _scoped_cache_key(server_name)
     with _cache_lock:
         data = _load_all()
-        if server_name in data:
-            del data[server_name]
+        changed = False
+        if cache_key is not None:
+            if cache_key in data:
+                del data[cache_key]
+                changed = True
+        elif _is_per_user_oauth_server(server_name):
+            # No principal is bound (e.g. config/admin maintenance). Clearing is
+            # intentionally destructive across this logical server's cache
+            # entries but does not grant access to any cached content.
+            prefix = f"{server_name}@@u-v1-"
+            for key in list(data):
+                if key.startswith(prefix):
+                    del data[key]
+                    changed = True
+        if changed:
             _save_all(data)
 
 
