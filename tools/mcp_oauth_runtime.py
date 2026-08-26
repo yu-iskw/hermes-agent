@@ -10,10 +10,9 @@ call sites continue to use logical names while storage is keyed internally by
 ``server@@<opaque OAuthScope>``. There is deliberately no "find any connection
 with the same server name" fallback.
 
-Credential identity never comes from model-visible tool arguments. It is
-resolved from trusted task-local gateway ContextVars and, for long-lived MCP
-loop tasks whose ambient context is no longer available, an immutable weakly
-pinned task scope.
+The adapters are installed only for explicit ``per_user`` mode. Historical
+``shared`` OAuth therefore keeps the original runtime objects and semantics
+byte-for-byte outside this module.
 """
 
 from __future__ import annotations
@@ -27,12 +26,10 @@ from tools.mcp_oauth_identity import (
     McpOAuthScope,
     MissingMcpOAuthIdentityError,
     connection_registry_key,
+    get_oauth_identity_mode,
     try_resolve_oauth_scope,
 )
 
-# A long-lived transport task may outlive the request context that created it.
-# Weak keys ensure task-bound identity disappears with the task and can never
-# become a process-global credential selector.
 _TASK_SCOPES: "weakref.WeakKeyDictionary[asyncio.Task, dict[str, McpOAuthScope]]" = (
     weakref.WeakKeyDictionary()
 )
@@ -42,8 +39,8 @@ _MISSING_SCOPE_SUFFIX = "@@<missing-authenticated-identity>"
 
 
 def _task_scope(server_name: str) -> McpOAuthScope | None:
-    # Request context wins. This is what lets a shared gateway worker safely
-    # handle Alice and then Bob without inheriting Alice's transport identity.
+    # Request context wins. This lets a shared gateway worker safely handle
+    # Alice and then Bob without inheriting Alice's transport identity.
     ambient = try_resolve_oauth_scope()
     if ambient is not None:
         return ambient
@@ -61,6 +58,8 @@ def _task_scope(server_name: str) -> McpOAuthScope | None:
 
 def bind_runtime_scope(server_name: str, scope: McpOAuthScope) -> None:
     """Pin a resolved OAuth scope to the current long-lived server task."""
+    if not scope.is_per_user:
+        return
     try:
         task = asyncio.current_task()
     except RuntimeError:
@@ -122,14 +121,12 @@ class _ScopedNameMixin:
         visible: list[Any] = []
         raw_set = set(raw)
 
-        # Ordinary non-OAuth keys remain visible exactly as before.
         for key in raw:
             if not isinstance(key, str):
                 visible.append(key)
             elif key not in self.oauth_servers and not _is_internal_scoped_key(key):
                 visible.append(key)
 
-        # Each OAuth logical server is visible only if THIS scope has state.
         for server_name in self.oauth_servers:
             if _logical_state_key(server_name) in raw_set:
                 visible.append(server_name)
@@ -145,8 +142,8 @@ class ScopedMCPServerRegistry(_ScopedNameMixin, dict):
 
     def mark_oauth_server(self, server_name: str) -> None:
         self._mark_oauth_server(server_name)
-        # A pre-install headless startup may have inserted a raw server entry.
-        # Ownership is unknowable, so it must never become a per-user fallback.
+        # Anything at the historical raw key predates the per-user boundary;
+        # ownership is unknowable, so it cannot be assigned to the first user.
         dict.pop(self, server_name, None)
 
     def _connection_key_for_write(self, key: Any) -> Any:
@@ -197,9 +194,7 @@ class ScopedNameDict(_ScopedNameMixin, dict):
 
     def mark_oauth_server(self, server_name: str) -> None:
         self._mark_oauth_server(server_name)
-        # State produced before the runtime knew this was per-user belongs to
-        # no authenticated principal. Drop it rather than assigning it to the
-        # first user who arrives.
+        # Pre-bound state belongs to no authenticated principal.
         dict.pop(self, server_name, None)
 
     def __getitem__(self, key: Any) -> Any:
@@ -261,8 +256,6 @@ class ScopedNameSet(_ScopedNameMixin, set):
                 self.discard(element)
 
     def __iter__(self) -> Iterator[Any]:
-        # ``set(_server_connecting)`` must expose the current request's logical
-        # names, not every user's encoded state key.
         return iter(self._visible_logical_keys(list(set.__iter__(self))))
 
 
@@ -278,8 +271,6 @@ class PersistentPerUserLazyConfigs(dict):
 
     def pop(self, key: Any, default: Any = ...):
         if isinstance(key, str) and key in self.oauth_servers and key in self:
-            # Per-user OAuth has N independent transports. Alice's successful
-            # lazy connect must not consume the config Bob needs later.
             return self[key]
         if default is ...:
             return dict.pop(self, key)
@@ -295,13 +286,16 @@ def _wrap_scoped_dict(mcp_tool, attr_name: str, server_name: str) -> None:
 
 
 def prepare_oauth_server_runtime(server_name: str) -> None:
-    """Install/mark all per-user runtime views before identity resolution.
+    """Install/mark per-user runtime views before principal resolution.
 
-    It is safe to call repeatedly and deliberately runs before
-    ``resolve_oauth_scope``. Thus a headless startup can fail closed in its
-    anonymous bucket while a later Alice/Bob request sees independent
-    connection, connect-backoff, error, and circuit-breaker state.
+    ``shared`` mode returns immediately so existing single-user CLI/profile
+    deployments keep the original plain dict/set objects and lifecycle.
+    Invalid configuration propagates from ``get_oauth_identity_mode`` rather
+    than silently falling back to shared semantics.
     """
+    if get_oauth_identity_mode() != "per_user":
+        return
+
     from tools import mcp_tool
 
     with _INSTALL_LOCK:
@@ -332,8 +326,6 @@ def prepare_oauth_server_runtime(server_name: str) -> None:
             mcp_tool._lazy_server_configs = lazy
         lazy.mark_oauth_server(server_name)
 
-        # Keep safe connection config as reusable metadata. Authentication
-        # material itself still lives only in the scoped provider/storage.
         if server_name not in lazy:
             try:
                 config = (mcp_tool._load_mcp_config() or {}).get(server_name)
