@@ -14,14 +14,15 @@ returns missing and the existing lazy-connect path can create the caller's own
 connection.
 
 This compatibility layer keeps #78174 narrowly scoped instead of spreading
-identity plumbing through every MCP handler.  Scope selection remains outside
+identity plumbing through every MCP handler. Scope selection remains outside
 the model/tool argument surface and is driven by trusted ContextVars.
 """
 
 from __future__ import annotations
 
+import asyncio
 import threading
-from contextvars import ContextVar
+import weakref
 from typing import Any
 
 from tools.mcp_oauth_identity import (
@@ -31,30 +32,50 @@ from tools.mcp_oauth_identity import (
     try_resolve_oauth_scope,
 )
 
-# A long-lived MCPServerTask keeps the context captured when it was created.
-# Binding the already-resolved scope here also makes registry operations robust
-# if a host's async scheduling implementation does not propagate gateway
-# ContextVars exactly as CPython's run_coroutine_threadsafe currently does.
-_TASK_SCOPES: ContextVar[dict[str, McpOAuthScope]] = ContextVar(
-    "mcp_oauth_runtime_task_scopes",
-    default={},
+# Some hosts may not preserve caller ContextVars when moving work onto the
+# dedicated MCP event loop. Pin the scope to the actual long-lived asyncio Task
+# as a fallback. Weak keys disappear automatically when the task exits, so a
+# reused request ContextVar can never inherit another user's pin.
+_TASK_SCOPES: "weakref.WeakKeyDictionary[asyncio.Task, dict[str, McpOAuthScope]]" = (
+    weakref.WeakKeyDictionary()
 )
-
+_TASK_SCOPE_LOCK = threading.Lock()
 _INSTALL_LOCK = threading.Lock()
 
 
 def _task_scope(server_name: str) -> McpOAuthScope | None:
-    explicit = _TASK_SCOPES.get().get(server_name)
-    if explicit is not None:
-        return explicit
-    return try_resolve_oauth_scope()
+    # Prefer a currently bound authenticated request principal. This lets a
+    # reused host task move safely between users instead of being stuck on an
+    # earlier runtime pin.
+    ambient = try_resolve_oauth_scope()
+    if ambient is not None:
+        return ambient
+
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        task = None
+    if task is None:
+        return None
+    with _TASK_SCOPE_LOCK:
+        scopes = _TASK_SCOPES.get(task)
+        return scopes.get(server_name) if scopes else None
 
 
 def bind_runtime_scope(server_name: str, scope: McpOAuthScope) -> None:
-    """Bind a resolved scope to the current server task's ContextVar state."""
-    current = dict(_TASK_SCOPES.get())
-    current[server_name] = scope
-    _TASK_SCOPES.set(current)
+    """Pin a resolved OAuth scope to the current long-lived server task."""
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        task = None
+    if task is None:
+        # Sync callers already have their gateway ContextVars, and there is no
+        # safe process-global fallback. Do not manufacture one.
+        return
+    with _TASK_SCOPE_LOCK:
+        current = dict(_TASK_SCOPES.get(task) or {})
+        current[server_name] = scope
+        _TASK_SCOPES[task] = current
 
 
 class ScopedMCPServerRegistry(dict):
@@ -70,14 +91,10 @@ class ScopedMCPServerRegistry(dict):
     def _key_for_read(self, key: Any) -> Any:
         if not isinstance(key, str) or key not in self.oauth_servers:
             return key
-        # Encoded/internal keys pass through. They are intentionally opaque.
         if "@@u-v1-" in key:
             return key
         scope = _task_scope(key)
         if scope is None:
-            # Missing authenticated identity must never select a shared/other
-            # connection. A guaranteed-missing key gives ordinary dict callers
-            # fail-closed semantics without changing every call site.
             return f"{key}@@<missing-authenticated-identity>"
         return connection_registry_key(key, scope)
 
@@ -134,8 +151,6 @@ class PersistentPerUserLazyConfigs(dict):
 
     def pop(self, key: Any, default: Any = ...):
         if isinstance(key, str) and key in self.oauth_servers and key in self:
-            # Return without deleting so Alice's successful lazy connect does
-            # not prevent Bob/Carol from creating their own scoped connection.
             return self[key]
         if default is ...:
             return super().pop(key)
@@ -145,10 +160,8 @@ class PersistentPerUserLazyConfigs(dict):
 def prepare_oauth_server_runtime(server_name: str) -> None:
     """Install/mark scope-aware MCP registries before resolving identity.
 
-    This is intentionally called before ``resolve_oauth_scope``. On a headless
-    gateway startup with no human bound, the provider build then fails closed
-    but the runtime is already prepared for a later authenticated user's lazy
-    connection.
+    Called before ``resolve_oauth_scope`` so headless startup can fail closed
+    yet retain connection config for a later authenticated user's lazy start.
     """
     from tools import mcp_tool
 
@@ -165,9 +178,6 @@ def prepare_oauth_server_runtime(server_name: str) -> None:
             mcp_tool._lazy_server_configs = lazy
         lazy.mark_oauth_server(server_name)
 
-        # Preserve the full connection config for later users.  This is safe
-        # config metadata, not credential state; actual OAuth providers/tokens
-        # are still created under the caller's immutable scope.
         if server_name not in lazy:
             try:
                 config = (mcp_tool._load_mcp_config() or {}).get(server_name)
